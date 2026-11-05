@@ -1,0 +1,10 @@
+# Deny the network widget services by default
+# Allow a GUI domain per service in a lower numbered file, as
+# qubes.NetStatus + sys-gui-alice @default allow target=sys-net autostart=no
+
+qubes.NetStatus     *  @anyvm  @anyvm  deny
+qubes.NetScan       *  @anyvm  @anyvm  deny
+qubes.NetConnect    *  @anyvm  @anyvm  deny
+qubes.NetDisconnect *  @anyvm  @anyvm  deny
+qubes.NetForget     *  @anyvm  @anyvm  deny
+qubes.NetRadio      *  @anyvm  @anyvm  deny

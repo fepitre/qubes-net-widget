@@ -1,0 +1,92 @@
+#
+# This is the SPEC file for creating the dom0 RPM.
+#
+#
+# The Qubes OS Project, http://www.qubes-os.org
+#
+# Copyright (C) 2026  Frédéric Pierret <frederic@invisiblethingslab.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#
+
+
+Name:		qubes-net-widget-dom0
+Version:	@VERSION@
+Release:	1%{dist}
+Summary:	Network tray widget for dom0
+
+Group:		Qubes
+License:	GPL-2.0-or-later
+URL:		https://github.com/fepitre/qubes-net-widget
+
+BuildArch:	noarch
+
+BuildRequires:	make
+BuildRequires:	python3
+BuildRequires:	python3-gobject
+BuildRequires:	gtk3
+BuildRequires:	gobject-introspection
+
+Requires:	python3
+Requires:	python3-gobject
+Requires:	gtk3
+Requires:	gobject-introspection
+Requires:	librsvg2
+Requires:	qubes-core-qrexec-dom0
+Requires:	qubes-desktop-linux-manager
+
+Source0: qubes-net-widget-%{version}.tar.gz
+
+%description
+Tray widget for dom0 showing Ethernet and Wi-Fi of the network qube. It
+scans and connects Wi-Fi networks, edits IP settings and forgets saved
+networks through the qubes.Net* qrexec services of that qube. The
+dom0 users who get it and the network qube are set in
+/etc/qubes/net-widget.conf. This package also ships the default
+deny policy of the services.
+
+%prep
+%setup -q -n qubes-net-widget-%{version}
+
+%build
+make clean
+make build
+
+%check
+# The widget tests skip without GTK
+/usr/bin/python3 -I -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk'
+make check
+
+%install
+rm -rf $RPM_BUILD_ROOT
+make install-dom0 DESTDIR=$RPM_BUILD_ROOT
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
+%files
+%defattr(-,root,root,-)
+%license LICENSE
+%doc README.md
+/usr/bin/qubes-net-widget
+/etc/xdg/autostart/qubes-net-widget.desktop
+%dir /usr/share/qubes-net-widget
+/usr/share/qubes-net-widget/icons
+%config(noreplace) /etc/qubes/net-widget.conf
+%config(noreplace) %attr(0664,root,qubes) /etc/qubes/policy.d/90-net-widget.policy
+
+%changelog
+@CHANGELOG@

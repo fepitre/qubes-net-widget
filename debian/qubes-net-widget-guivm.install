@@ -1,0 +1,3 @@
+usr/bin/qubes-net-widget
+etc/xdg/autostart/qubes-net-widget.desktop
+usr/share/qubes-net-widget/icons

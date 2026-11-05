@@ -1,0 +1,15 @@
+host:
+  rpm:
+    build:
+    - rpm_spec/net-widget-dom0.spec
+vm:
+  rpm:
+    build:
+    - rpm_spec/net-widget.spec
+  deb:
+    build:
+    - debian
+
+vm-bookworm:
+  deb:
+    build: []

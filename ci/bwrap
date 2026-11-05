@@ -1,0 +1,4 @@
+#!/bin/sh
+# Make glycin skip its sandbox in a container
+echo "bwrap: setting up uid map: Permission denied" >&2
+exit 1

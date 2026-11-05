@@ -1,0 +1,135 @@
+#
+# This is the SPEC file for creating binary and source RPMs for the VMs.
+#
+#
+# The Qubes OS Project, http://www.qubes-os.org
+#
+# Copyright (C) 2026  Frédéric Pierret <frederic@invisiblethingslab.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#
+
+
+Name:		qubes-net-widget
+Version:	@VERSION@
+Release:	1%{dist}
+Summary:	Network widget for Qubes OS
+
+Group:		Qubes
+License:	GPL-2.0-or-later
+URL:		https://github.com/fepitre/qubes-net-widget
+
+BuildArch:	noarch
+
+BuildRequires:	make
+BuildRequires:	python3
+BuildRequires:	python3-gobject
+BuildRequires:	gtk3
+BuildRequires:	gobject-introspection
+BuildRequires:	NetworkManager-libnm
+
+Source0: %{name}-%{version}.tar.gz
+
+%description
+Network widget for Qubes OS: qrexec services in the network qube and a
+tray widget in the GUI domains.
+
+%package netvm
+Summary:	Network services of the network widget for the network qube
+
+Requires:	python3
+Requires:	python3-gobject-base
+Requires:	NetworkManager
+Requires:	NetworkManager-libnm
+Requires:	NetworkManager-wifi
+Requires:	conntrack-tools
+Requires:	iproute
+Requires:	qubes-core-agent-network-manager
+Requires:	qubes-core-qrexec-vm
+
+%description netvm
+The qubes.NetStatus, NetScan, NetConnect, NetDisconnect, NetForget
+and NetRadio qrexec services for the network qube. Each one reads a single
+JSON document on stdin, validates it whole and drives NetworkManager over
+D-Bus as root. Install it only in the template of the network qube.
+
+%package guivm
+Summary:	Network tray widget for the GUI domains
+
+Requires:	python3
+Requires:	python3-gobject
+Requires:	gtk3
+Requires:	gobject-introspection
+Requires:	librsvg2
+Requires:	qubes-core-qrexec-vm
+Requires:	qubes-desktop-linux-manager
+
+%description guivm
+Tray widget showing Ethernet and Wi-Fi of the network qube in a GUI
+domain. It starts only where the 'qubes-net-widget' qvm-service is
+enabled and calls the network services through qrexec, under the dom0
+policy. Install it only in the template of the GUI domains.
+
+%prep
+%setup -q
+
+%build
+make clean
+make build
+
+%check
+# The widget tests skip without GTK
+/usr/bin/python3 -I -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk'
+make check
+
+%install
+rm -rf $RPM_BUILD_ROOT
+make install-vm DESTDIR=$RPM_BUILD_ROOT
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
+%files netvm
+%defattr(-,root,root,-)
+%license LICENSE
+%doc README.md
+%dir /usr/lib/qubes-net-widget
+/usr/lib/qubes-net-widget/netsvc.py
+/etc/NetworkManager/dispatcher.d/90-qubes-net-conntrack
+/etc/qubes-rpc/qubes.NetStatus
+/etc/qubes-rpc/qubes.NetScan
+/etc/qubes-rpc/qubes.NetConnect
+/etc/qubes-rpc/qubes.NetDisconnect
+/etc/qubes-rpc/qubes.NetForget
+/etc/qubes-rpc/qubes.NetRadio
+%config(noreplace) /etc/qubes/rpc-config/qubes.NetStatus
+%config(noreplace) /etc/qubes/rpc-config/qubes.NetScan
+%config(noreplace) /etc/qubes/rpc-config/qubes.NetConnect
+%config(noreplace) /etc/qubes/rpc-config/qubes.NetDisconnect
+%config(noreplace) /etc/qubes/rpc-config/qubes.NetForget
+%config(noreplace) /etc/qubes/rpc-config/qubes.NetRadio
+
+%files guivm
+%defattr(-,root,root,-)
+%license LICENSE
+%doc README.md
+/usr/bin/qubes-net-widget
+/etc/xdg/autostart/qubes-net-widget.desktop
+%dir /usr/share/qubes-net-widget
+/usr/share/qubes-net-widget/icons
+
+%changelog
+@CHANGELOG@

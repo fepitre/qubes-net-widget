@@ -1,0 +1,4 @@
+rpm/
+pkgs/
+*.gz
+__pycache__/

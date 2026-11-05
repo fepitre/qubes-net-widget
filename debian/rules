@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	$(MAKE) install-vm DESTDIR=$(CURDIR)/debian/tmp
+
+override_dh_auto_test:
+	python3 -I -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk'
+	$(MAKE) check

@@ -1,0 +1,22 @@
+[MASTER]
+persistent=no
+extension-pkg-allow-list=gi
+
+[MESSAGES CONTROL]
+disable=
+  broad-exception-caught,
+  missing-docstring,
+  invalid-name,
+  design,
+  duplicate-code,
+  fixme,
+  import-outside-toplevel,
+  too-many-lines,
+  wrong-import-position,
+  wrong-import-order
+
+[REPORTS]
+output-format=colorized
+
+[FORMAT]
+max-line-length=80

@@ -1,0 +1,4 @@
+usr/lib/qubes-net-widget/netsvc.py
+etc/NetworkManager/dispatcher.d/90-qubes-net-conntrack
+etc/qubes-rpc/qubes.Net*
+etc/qubes/rpc-config/qubes.Net*

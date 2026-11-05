@@ -1,0 +1,74 @@
+include:
+  - project: 'QubesOS/qubes-continuous-integration'
+    file: '/common.yml'
+  - project: 'QubesOS/qubes-continuous-integration'
+    file: '/devel/gitlab-base.yml'
+  - project: 'QubesOS/qubes-continuous-integration'
+    file: '/devel/gitlab-host.yml'
+  - project: 'QubesOS/qubes-continuous-integration'
+    file: '/devel/gitlab-vm-fedora.yml'
+  - project: 'QubesOS/qubes-continuous-integration'
+    file: '/devel/gitlab-vm-debian.yml'
+
+variables:
+  PYTHON_FILES: src/qubes-net-widget src/qubes-netsvc.py tests ci
+
+.gtk:
+  before_script:
+    - "PATH=$PATH:$HOME/.local/bin"
+    # For glycin, see ci/bwrap
+    - "PATH=$PWD/ci:$PATH"
+    - sudo dnf install -y python3-gobject gtk3 NetworkManager-libnm
+      python3-pip xorg-x11-server-Xvfb
+      adwaita-icon-theme librsvg2 google-noto-sans-fonts
+      google-noto-sans-arabic-fonts google-noto-emoji-fonts
+    - pip3 install --quiet -r ci/requirements.txt
+    - git clone https://github.com/QubesOS/qubes-desktop-linux-manager
+      ~/desktop-linux-manager
+
+checks:tests:
+  extends: .gtk
+  stage: checks
+  variables:
+    PYTEST_ADDOPTS: "--color=yes -W ignore::DeprecationWarning"
+  script:
+    - xvfb-run -a python3 -m coverage run --include='src/*' -m pytest -v tests
+    - python3 -m coverage report
+
+checks:screenshots:
+  extends: .gtk
+  stage: checks
+  script:
+    - PYTHONPATH=~/desktop-linux-manager
+      xvfb-run -a -s "-screen 0 1280x1024x24" python3 ci/screenshots.py
+      screenshots
+  artifacts:
+    when: always
+    expire_in: 1 month
+    paths:
+      - screenshots/
+
+checks:pylint:
+  extends: .gtk
+  stage: checks
+  before_script:
+    - !reference [.gtk, before_script]
+    # remove when https://github.com/pylint-dev/astroid/issues/2190 is fixed
+    - file_to_patch=$(python3 -c 'import astroid.builder;print(astroid.builder.__file__)') &&
+      patch_url=https://gitlab.com/QubesOS/qubes-continuous-integration/-/raw/main/scripts/pylint-astroid-workaround-2190.patch &&
+      if grep -q 'from_node, global_names' "$file_to_patch"; then patch_url=${patch_url/.patch/-4.0.1.patch}; fi &&
+      curl -fsSL "$patch_url" | sudo patch "$file_to_patch"
+  script:
+    - PYTHONPATH=~/desktop-linux-manager python3 -m pylint $PYTHON_FILES
+
+checks:black:
+  extends: .lint
+  stage: checks
+  variables:
+    DIR: $PYTHON_FILES
+    SKIP_PYLINT: 1
+    BLACK_ARGS: -l80 -v --diff --color --check
+
+checks:shellcheck:
+  extends: .shellcheck
+  stage: checks

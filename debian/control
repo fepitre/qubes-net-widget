@@ -1,0 +1,45 @@
+Source: qubes-net-widget
+Section: admin
+Priority: optional
+Maintainer: Frédéric Pierret (fepitre) <frederic@invisiblethingslab.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ python3,
+ python3-gi,
+ gir1.2-gtk-3.0,
+ gir1.2-nm-1.0,
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: qubes-net-widget-netvm
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3,
+ python3-gi,
+ gir1.2-nm-1.0,
+ network-manager,
+ conntrack,
+ iproute2,
+ qubes-core-agent-network-manager,
+ qubes-core-qrexec,
+Description: Network services of the network widget for the network qube
+ The qrexec services that report and change Ethernet and Wi-Fi of the
+ network qube through NetworkManager, for the network widget of dom0 and
+ the GUI domains. Install it only in the template of the network qube.
+
+Package: qubes-net-widget-guivm
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3,
+ python3-gi,
+ gir1.2-gtk-3.0,
+ librsvg2-common,
+ qubes-core-qrexec,
+ qubes-desktop-linux-manager,
+Description: Network tray widget for the GUI domains
+ Tray widget showing Ethernet and Wi-Fi of the network qube in a GUI
+ domain. It starts only where the 'qubes-net-widget' qvm-service is
+ enabled and calls the network services through qrexec, under the dom0
+ policy. Install it only in the template of the GUI domains.

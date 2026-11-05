@@ -1,0 +1,18 @@
+#!/bin/bash
+# Drop flows NATed to an address no uplink holds
+case ${2:-} in up|down|dhcp4-change|dhcp6-change) ;; *) exit 0 ;; esac
+for fam in 4 6; do
+    keep=" $(ip -"$fam" -o addr show | awk '$2 !~ /^(lo|vif)/ {split($4, a, "/"); printf "%s ", a[1]}')"
+    if ! flows=$(conntrack -L --src-nat -f "ipv$fam" 2>/dev/null); then
+        logger -t qubes-net-widget "Failed to read the NAT flows, on $1 $2"
+        continue
+    fi
+    printf '%s\n' "$flows" \
+        | awk '{n = 0; for (i = 1; i <= NF; i++) if ($i ~ /^dst=/ && ++n == 2) print substr($i, 5)}' \
+        | sort -u | while read -r addr; do
+            case $keep in *" $addr "*) continue ;; esac
+            conntrack -D --src-nat -f "ipv$fam" --reply-dst "$addr" >/dev/null 2>&1 || :
+            logger -t qubes-net-widget "Dropped flows NATed to '$addr', on $1 $2"
+        done
+done
+exit 0

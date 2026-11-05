@@ -1,0 +1,1229 @@
+#!/usr/bin/python3 -I
+"""
+Network widget for Ethernet and Wi-Fi of the network qube
+"""
+
+import argparse
+import ctypes
+import ipaddress
+import json
+import os
+import pwd
+import re
+import resource
+import selectors
+import subprocess
+import sys
+import threading
+import time
+import warnings
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+# StatusIcon is deprecated, as in the qui widgets
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+APP_ID = "org.qubes.NetWidget"
+CONF = "/etc/qubes/net-widget.conf"
+FLAG = "/run/qubes-service/qubes-net-widget"
+ICONS = "/usr/share/qubes-net-widget/icons"
+QREXEC_DOM0 = "/usr/lib/qubes/qrexec-client"
+QREXEC_VM = "/usr/bin/qrexec-client-vm"
+MAX_ANSWER = 256 * 1024
+MAX_ERR = 4096
+POLL = 30
+TIMEOUT = 110
+
+QUBE_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{0,30}")
+UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+IFACE_RE = re.compile(r"[a-z][a-z0-9]{0,14}")
+HEX_RE = re.compile(r"(?:[0-9a-f]{2}){0,32}")
+DOMAIN_RE = re.compile(r"[a-z0-9.-]{1,253}")
+ADDR_RE = re.compile(r"[0-9a-f.:]{2,45}(?:%[a-z0-9]{1,15})?(?:/[0-9]{1,3})?")
+
+STATES = {
+    "connected": "Connected",
+    "connecting": "Connecting",
+    "disconnecting": "Disconnecting",
+    "disconnected": "Disconnected",
+    "unavailable": "No cable",
+    "failed": "Failed",
+    "unknown": "Unknown",
+}
+SECURITY = {
+    "open": "Open",
+    "wep": "WEP, unsupported",
+    "wpa2-psk": "WPA2 Personal",
+    "wpa3-psk": "WPA3 Personal",
+    "wpa3-transition": "WPA2/WPA3 Personal",
+    "wpa2-eap": "WPA2 Enterprise",
+    "wpa3-eap": "WPA3 Enterprise",
+    "unsupported": "Unsupported",
+}
+CONNECTABLE = ("open", "wpa2-psk", "wpa3-psk", "wpa3-transition")
+METHODS = {
+    4: [
+        ("auto", "Automatic (DHCP)"),
+        ("manual", "Manual"),
+        ("disabled", "Disabled"),
+    ],
+    6: [
+        ("auto", "Automatic"),
+        ("dhcp", "Automatic (DHCP only)"),
+        ("manual", "Manual"),
+        ("disabled", "Disabled"),
+    ],
+}
+# Only printable ASCII from the network qube in dom0
+ASCII_ONLY = False
+CSS = b"""
+.net-title { font-weight: 600; }
+.net-soft { color: @soft-text-color; }
+.net-error { color: @problem-frame; }
+.net-warning { color: @info-frame; }
+"""
+
+
+class CallError(Exception):
+    """
+    Failed call to the network qube
+    """
+
+
+def safe_text(text, limit=64):
+    """
+    Escape unprintable characters, and non-ASCII in dom0
+    """
+    out = []
+    for c in text[:limit]:
+        n = ord(c)
+        if c == "\\":
+            out.append("\\\\")
+        elif 0x20 <= n < 0x7F or (c.isprintable() and not ASCII_ONLY):
+            out.append(c)
+        elif n < 0x100:
+            out.append(f"\\x{n:02x}")
+        elif n < 0x10000:
+            out.append(f"\\u{n:04x}")
+        else:
+            out.append(f"\\U{n:08x}")
+    return "".join(out) + ("..." if len(text) > limit else "")
+
+
+def ssid_label(raw):
+    # Invalid bytes as lone surrogates
+    return safe_text(raw.decode("utf-8", "surrogateescape"), 32)
+
+
+def load_transport():
+    """
+    Transport of this session, or None for no widget
+    """
+    if os.path.exists("/etc/qubes-release"):
+        try:
+            with open(CONF, encoding="ascii") as f:
+                text = f.read(4096)
+        except (OSError, UnicodeDecodeError):
+            return None
+        conf = {}
+        for line in text.splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                conf[key.strip()] = value.strip()
+        me = pwd.getpwuid(os.getuid()).pw_name
+        netqube = conf.get("netqube", "")
+        if me not in conf.get("users", "").split():
+            return None
+        if not QUBE_RE.fullmatch(netqube) or netqube == "dom0":
+            return None
+        return Transport(netqube, dom0=True)
+    if os.path.exists(FLAG):
+        return Transport("@default", dom0=False)
+    return None
+
+
+class Transport:
+    """
+    JSON request and answer over qrexec
+    """
+
+    def __init__(self, target, dom0):
+        self.target = target
+        self.dom0 = dom0
+        self.name = target if dom0 else "the network qube"
+
+    def argv(self, service):
+        if self.dom0:
+            return [
+                QREXEC_DOM0,
+                "-d",
+                self.target,
+                f"DEFAULT:QUBESRPC {service}+ dom0",
+            ]
+        return [QREXEC_VM, "@default", service]
+
+    def call(self, service, doc):
+        data = json.dumps(doc, ensure_ascii=True).encode()
+        try:
+            proc = subprocess.Popen(  # pylint: disable=consider-using-with
+                self.argv(service),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+        except OSError:
+            raise CallError("Cannot run qrexec") from None
+        out, err = self._exchange(proc, data)
+        rc = proc.returncode
+        if b"Request refused" in err or (rc == 126 and not out):
+            raise CallError(
+                f"Cannot call {self.name}: refused by the dom0 policy or"
+                " not running"
+            )
+        if not out:
+            raise CallError(f"Cannot reach {self.name}")
+        try:
+            answer = json.loads(
+                out.decode("utf-8"),
+                object_pairs_hook=_unique,
+                parse_constant=_no_constant,
+            )
+        except (ValueError, RecursionError):
+            raise CallError(f"Invalid answer from {self.name}") from None
+        if not isinstance(answer, dict) or not isinstance(
+            answer.get("ok"), bool
+        ):
+            raise CallError(f"Invalid answer from {self.name}")
+        if not answer["ok"]:
+            error = answer.get("error")
+            if not isinstance(error, str):
+                raise CallError(f"Invalid answer from {self.name}")
+            raise CallError(f"From {self.name}: {safe_text(error, 200)}")
+        return answer
+
+    @staticmethod
+    def _exchange(proc, data):
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdin, selectors.EVENT_WRITE)
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        sel.register(proc.stderr, selectors.EVENT_READ)
+        out, err = bytearray(), bytearray()
+        view = memoryview(data)
+        end = time.monotonic() + TIMEOUT
+        try:
+            while sel.get_map():
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise CallError("No answer in time from the network qube")
+                for key, _ in sel.select(left):
+                    f = key.fileobj
+                    if f is proc.stdin:
+                        try:
+                            n = os.write(f.fileno(), view[:65536])
+                        except BrokenPipeError:
+                            n = len(view)
+                        view = view[n:]
+                        if not view:
+                            sel.unregister(f)
+                            f.close()
+                        continue
+                    chunk = os.read(f.fileno(), 65536)
+                    if not chunk:
+                        sel.unregister(f)
+                        continue
+                    buf = out if f is proc.stdout else err
+                    buf += chunk
+                    if len(out) > MAX_ANSWER:
+                        raise CallError("Invalid answer: too large")
+                    if len(err) > MAX_ERR:
+                        del err[MAX_ERR:]
+            proc.wait(max(1, end - time.monotonic()))
+        except (CallError, subprocess.TimeoutExpired) as e:
+            proc.kill()
+            proc.wait()
+            if isinstance(e, CallError):
+                raise
+            raise CallError("No answer in time from the network qube") from None
+        finally:
+            view.release()
+            sel.close()
+        return bytes(out), bytes(err)
+
+
+def _unique(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def _no_constant(_name):
+    raise ValueError("constant")
+
+
+class BadAnswer(Exception):
+    pass
+
+
+def _of(d, key, kind):
+    value = d.get(key) if isinstance(d, dict) else None
+    if kind is int and isinstance(value, bool):
+        raise BadAnswer(key)
+    if not isinstance(value, kind):
+        raise BadAnswer(key)
+    return value
+
+
+def _opt(d, key, check):
+    value = d.get(key)
+    return None if value is None else check(value)
+
+
+def _uuid(value):
+    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
+        raise BadAnswer("uuid")
+    return value
+
+
+def _iface(value):
+    if not isinstance(value, str) or not IFACE_RE.fullmatch(value):
+        raise BadAnswer("iface")
+    return value
+
+
+def _enum(value, allowed):
+    if not isinstance(value, str) or value not in allowed:
+        raise BadAnswer("enum")
+    return value
+
+
+def _hex(value):
+    if not isinstance(value, str) or not HEX_RE.fullmatch(value):
+        raise BadAnswer("hex")
+    return bytes.fromhex(value)
+
+
+def _list(value, limit):
+    if not isinstance(value, list):
+        raise BadAnswer("list")
+    return value[:limit]
+
+
+def _addr(value, prefix=False):
+    if not isinstance(value, str) or len(value) > 50:
+        raise BadAnswer("address")
+    try:
+        if prefix:
+            text = str(ipaddress.ip_interface(value))
+        else:
+            text = str(ipaddress.ip_address(value))
+    except ValueError:
+        raise BadAnswer("address") from None
+    # ipaddress keeps any text after '%' as an IPv6 scope
+    if not ADDR_RE.fullmatch(text):
+        raise BadAnswer("address")
+    return text
+
+
+def _ip_config(d):
+    return {
+        "addresses": [
+            _addr(a, True) for a in _list(_of(d, "addresses", list), 32)
+        ],
+        "gateway": _opt(d, "gateway", _addr),
+        "dns": [_addr(a) for a in _list(_of(d, "dns", list), 16)],
+    }
+
+
+def _ip_setting(d, version):
+    methods = [m for m, _ in METHODS[version]] + ["other"]
+    out = {"method": _enum(_of(d, "method", str), methods)}
+    out["addresses"] = [
+        _addr(a, True) for a in _list(d.get("addresses", []), 16)
+    ]
+    out["gateway"] = _opt(d, "gateway", _addr)
+    out["dns"] = [_addr(a) for a in _list(d.get("dns", []), 16)]
+    # A profile made elsewhere may hold anything
+    out["search"] = [
+        a.lower()
+        for a in _list(d.get("search", []), 16)
+        if isinstance(a, str) and DOMAIN_RE.fullmatch(a.lower())
+    ]
+    return out
+
+
+def _radio(d):
+    return {
+        "hardware": _of(d, "hardware", bool),
+        "enabled": _of(d, "enabled", bool),
+        "devices": _of(d, "devices", int),
+    }
+
+
+def _ap(d, scanned):
+    if not isinstance(d, dict):
+        raise BadAnswer("network")
+    out = {
+        "ssid": _hex(_of(d, "ssid_hex", str)),
+        "signal": max(0, min(100, _of(d, "signal", int))),
+        "security": _enum(_of(d, "security", str), SECURITY),
+    }
+    if scanned:
+        out["saved"] = _opt(d, "saved", _uuid)
+        out["active"] = _of(d, "active", bool)
+    return out
+
+
+def clean_status(answer):
+    """
+    Rebuild the status from its checked fields
+    """
+    out = {"radio": _radio(_of(answer, "radio", dict)), "devices": []}
+    for d in _list(_of(answer, "devices", list), 16):
+        kind = _enum(_of(d, "type", str), ("ethernet", "wifi"))
+        entry = {
+            "iface": _iface(_of(d, "iface", str)),
+            "type": kind,
+            "state": _enum(_of(d, "state", str), STATES),
+            "profile": _opt(d, "profile", _uuid),
+            "default4": _of(d, "default4", bool),
+            "default6": _of(d, "default6", bool),
+            "ipv4": _ip_config(_of(d, "ipv4", dict)),
+            "ipv6": _ip_config(_of(d, "ipv6", dict)),
+            "ap": None,
+        }
+        if kind == "wifi" and d.get("ap") is not None:
+            entry["ap"] = _ap(_of(d, "ap", dict), False)
+        out["devices"].append(entry)
+    out["profiles"] = []
+    for d in _list(_of(answer, "profiles", list), 128):
+        kind = _enum(_of(d, "type", str), ("ethernet", "wifi"))
+        entry = {
+            "uuid": _uuid(_of(d, "uuid", str)),
+            "type": kind,
+            "name": safe_text(_of(d, "name", str), 40),
+            "saved": _of(d, "saved", bool),
+            "active": _opt(d, "active", _iface),
+            "ipv4": _ip_setting(_of(d, "ipv4", dict), 4),
+            "ipv6": _ip_setting(_of(d, "ipv6", dict), 6),
+        }
+        if kind == "wifi":
+            entry["ssid"] = _hex(_of(d, "ssid_hex", str))
+            entry["hidden"] = _of(d, "hidden", bool)
+            entry["security"] = _enum(_of(d, "security", str), SECURITY)
+        out["profiles"].append(entry)
+    out["primary"] = _opt(answer, "primary", _uuid)
+    return out
+
+
+def clean_scan(answer):
+    return {
+        "radio": _radio(_of(answer, "radio", dict)),
+        "networks": [
+            _ap(n, True) for n in _list(_of(answer, "networks", list), 64)
+        ],
+    }
+
+
+def icon(name):
+    path = os.path.join(ICONS, f"qubes-net-{name}.svg")
+    return Gio.FileIcon.new(Gio.File.new_for_path(path))
+
+
+def bars(signal):
+    return 0 if signal < 5 else min(4, 1 + signal // 25)
+
+
+def load_style(widget):
+    """
+    Load the Qubes widgets' style, then ours
+    """
+    css = b""
+    try:
+        import importlib.resources
+
+        from qubes_config.widgets.gtk_utils import is_theme_light
+
+        styles = importlib.resources.files("qui") / "styles"
+        shade = "light" if is_theme_light(widget) else "dark"
+        css += (styles / f"qubes-colors-{shade}.css").read_bytes()
+        css += (styles / "qubes-widgets-base.css").read_bytes()
+    except Exception:  # plain GTK theme
+        css = b"@define-color soft-text-color #858585;"
+        css += b"@define-color problem-frame #b91c1c;"
+        css += b"@define-color info-frame #a16207;"
+    provider = Gtk.CssProvider()
+    try:
+        provider.load_from_data(css + CSS)
+    except GLib.Error:
+        return
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(),
+        provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+
+
+def label(text, css=None, xalign=0.0, wrap=False):
+    w = Gtk.Label(xalign=xalign)
+    w.set_text(text)
+    if wrap:
+        w.set_line_wrap(True)
+        w.set_max_width_chars(60)
+    if css:
+        w.get_style_context().add_class(css)
+    return w
+
+
+def split_values(text):
+    return [v for v in re.split(r"[\s,;]+", text.strip()) if v]
+
+
+class IPForm:
+    """
+    IPv4 or IPv6 settings of one connection
+    """
+
+    def __init__(self, version, current=None):
+        self.version = version
+        self.grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        self.method = Gtk.ComboBoxText()
+        for key, text in METHODS[version]:
+            self.method.append(key, text)
+        self.addresses = Gtk.Entry(hexpand=True)
+        self.gateway = Gtk.Entry(hexpand=True)
+        self.dns = Gtk.Entry(hexpand=True)
+        self.search = Gtk.Entry(hexpand=True)
+        example = "192.168.1.20/24" if version == 4 else "2001:db8::20/64"
+        self.addresses.set_placeholder_text(f"{example}, up to 4")
+        self.gateway.set_placeholder_text("optional")
+        self.dns.set_placeholder_text("up to 3, optional")
+        self.search.set_placeholder_text("example.org, up to 6, optional")
+        rows = [
+            ("Method", self.method),
+            ("Addresses", self.addresses),
+            ("Gateway", self.gateway),
+            ("DNS servers", self.dns),
+            ("Search domains", self.search),
+        ]
+        self.labels = {}
+        for i, (text, w) in enumerate(rows):
+            lab = label(text)
+            self.labels[w] = lab
+            self.grid.attach(lab, 0, i, 1, 1)
+            self.grid.attach(w, 1, i, 1, 1)
+        current = current or {"method": "auto"}
+        method = current.get("method", "auto")
+        if method not in dict(METHODS[version]):
+            method = "auto"
+        self.method.set_active_id(method)
+        self.addresses.set_text(", ".join(current.get("addresses", [])))
+        self.gateway.set_text(current.get("gateway") or "")
+        self.dns.set_text(", ".join(current.get("dns", [])))
+        self.search.set_text(", ".join(current.get("search", [])))
+        self.method.connect("changed", lambda *_: self.sync())
+
+    def sync(self):
+        method = self.method.get_active_id()
+        shown = {
+            "manual": (self.addresses, self.gateway, self.dns, self.search),
+            "auto": (self.dns, self.search),
+            "dhcp": (self.dns, self.search),
+            "disabled": (),
+        }[method]
+        for w in (self.addresses, self.gateway, self.dns, self.search):
+            w.set_visible(w in shown)
+            self.labels[w].set_visible(w in shown)
+        top = self.grid.get_toplevel()
+        if isinstance(top, Gtk.Window):
+            top.resize(460, 1)
+
+    def value(self):
+        """
+        Settings for the service, loosely checked
+        """
+        family = f"IPv{self.version}"
+        method = self.method.get_active_id()
+        out = {"method": method}
+        if method == "disabled":
+            return out
+        if method == "manual":
+            addresses = split_values(self.addresses.get_text())
+            if not addresses:
+                raise ValueError(f"Invalid {family} address: give one")
+            for a in addresses:
+                if "/" not in a:
+                    raise ValueError(
+                        f"Invalid {family} address: add the prefix, as /24"
+                    )
+            out["addresses"] = addresses
+            gateway = self.gateway.get_text().strip()
+            if gateway:
+                out["gateway"] = gateway
+        dns = split_values(self.dns.get_text())
+        if dns:
+            out["dns"] = dns
+        search = [s.lower() for s in split_values(self.search.get_text())]
+        if search:
+            out["search"] = search
+        return out
+
+
+class Dialog(Gtk.Dialog):
+    """
+    Dialog sending one request
+    """
+
+    def __init__(self, app, title, action):
+        super().__init__(title=title)
+        self.app = app
+        self.set_keep_above(True)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_default_size(460, -1)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.ok = self.add_button(action, Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+        self.box = self.get_content_area()
+        self.box.set_spacing(8)
+        self.box.set_border_width(12)
+        self.secrets = []
+        self.error = label("", "net-error", wrap=True)
+        self.spinner = Gtk.Spinner()
+        self.connect("response", self.on_response)
+        self.connect("destroy", lambda *_: self.clear_secrets())
+
+    def finish_layout(self):
+        self.box.pack_end(self.error, False, False, 0)
+        self.box.pack_end(self.spinner, False, False, 0)
+        self.show_all()
+        self.error.hide()
+        self.spinner.hide()
+
+    def request(self):
+        raise NotImplementedError
+
+    def password_entry(self):
+        e = Gtk.Entry(hexpand=True, visibility=False)
+        e.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        e.set_activates_default(True)
+        self.secrets.append(e)
+        return e
+
+    def clear_secrets(self):
+        for e in self.secrets:
+            e.set_text("")
+
+    def show_error(self, text):
+        self.error.set_text(text)
+        self.error.show()
+
+    def on_response(self, _dialog, response):
+        if response != Gtk.ResponseType.OK:
+            self.destroy()
+            return
+        try:
+            service, doc = self.request()
+        except ValueError as e:
+            self.show_error(str(e))
+            return
+        self.clear_secrets()
+        self.error.hide()
+        self.ok.set_sensitive(False)
+        self.spinner.show()
+        self.spinner.start()
+        self.app.call(service, doc, self.done)
+
+    def done(self, _result, error):
+        self.spinner.stop()
+        self.spinner.hide()
+        self.ok.set_sensitive(True)
+        if error is not None:
+            self.show_error(str(error))
+            return
+        self.destroy()
+        self.app.refresh(scan=True)
+
+
+class WifiDialog(Dialog):
+    """
+    Connect to a new or hidden Wi-Fi network
+    """
+
+    def __init__(self, app, network=None):
+        self.network = network
+        if network is None:
+            title = "Connect to a hidden network"
+        else:
+            title = f"Connect to {ssid_label(network['ssid'])}"
+        super().__init__(app, title, "Connect")
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        row = 0
+        self.ssid = None
+        self.security = Gtk.ComboBoxText()
+        for key in ("wpa2-psk", "wpa3-psk", "open"):
+            self.security.append(key, SECURITY[key])
+        if network is None:
+            self.ssid = Gtk.Entry(hexpand=True, max_length=32)
+            grid.attach(label("Network name"), 0, row, 1, 1)
+            grid.attach(self.ssid, 1, row, 1, 1)
+            row += 1
+            self.security.set_active_id("wpa2-psk")
+            grid.attach(label("Security"), 0, row, 1, 1)
+            grid.attach(self.security, 1, row, 1, 1)
+            row += 1
+        else:
+            sec = network["security"]
+            sec = {"wpa3-transition": "wpa3-psk"}.get(sec, sec)
+            self.security.set_active_id(sec)
+            grid.attach(label("Security"), 0, row, 1, 1)
+            grid.attach(label(SECURITY[network["security"]]), 1, row, 1, 1)
+            row += 1
+        self.box.pack_start(grid, False, False, 0)
+
+        self.personal = Gtk.Grid(column_spacing=10, row_spacing=6)
+        self.psk = self.password_entry()
+        self.personal.attach(label("Password"), 0, 0, 1, 1)
+        self.personal.attach(self.psk, 1, 0, 1, 1)
+        self.box.pack_start(self.personal, False, False, 0)
+
+        self.open_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.open_box.pack_start(
+            label(
+                "This network is open: anyone nearby can read and change what"
+                " is sent over it unencrypted.",
+                "net-warning",
+                wrap=True,
+            ),
+            False,
+            False,
+            0,
+        )
+        self.accept_open = Gtk.CheckButton.new_with_label(
+            "I understand, connect anyway"
+        )
+        self.open_box.pack_start(self.accept_open, False, False, 0)
+        self.box.pack_start(self.open_box, False, False, 0)
+
+        expander = Gtk.Expander(label="IP settings")
+        ip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.ipv4 = IPForm(4)
+        self.ipv6 = IPForm(6)
+        ip_box.pack_start(label("IPv4", "net-title"), False, False, 0)
+        ip_box.pack_start(self.ipv4.grid, False, False, 0)
+        ip_box.pack_start(label("IPv6", "net-title"), False, False, 0)
+        ip_box.pack_start(self.ipv6.grid, False, False, 0)
+        expander.add(ip_box)
+        self.box.pack_start(expander, False, False, 0)
+        self.security.connect("changed", lambda *_: self.sync())
+        self.finish_layout()
+        self.ipv4.sync()
+        self.ipv6.sync()
+        self.sync()
+
+    def sync(self):
+        kind = self.security.get_active_id().rpartition("-")[2]
+        self.personal.set_visible(kind == "psk")
+        self.open_box.set_visible(kind == "open")
+        self.resize(460, 1)
+
+    def request(self):
+        security = self.security.get_active_id()
+        wifi = {"security": security}
+        if self.ssid is not None:
+            name = self.ssid.get_text()
+            if not name or len(name.encode()) > 32:
+                raise ValueError("Invalid network name: 1 to 32 bytes")
+            wifi["ssid"] = name
+            wifi["hidden"] = True
+        else:
+            wifi["ssid_hex"] = self.network["ssid"].hex()
+        kind = security.rpartition("-")[2]
+        if kind == "psk":
+            psk = self.psk.get_text()
+            if (
+                psk
+                and self.network
+                and self.network["security"] == ("wpa3-transition")
+            ):
+                if len(psk) == 64 and re.fullmatch("[0-9a-fA-F]{64}", psk):
+                    wifi["security"] = "wpa2-psk"
+            if not psk:
+                raise ValueError("No password")
+            wifi["psk"] = psk
+        else:
+            if not self.accept_open.get_active():
+                raise ValueError(
+                    "Cannot connect: tick 'I understand, connect anyway'"
+                )
+            wifi["accept_open"] = True
+        doc = {"wifi": wifi}
+        for key, form in (("ipv4", self.ipv4), ("ipv6", self.ipv6)):
+            value = form.value()
+            if value != {"method": "auto"}:
+                doc[key] = value
+        return "qubes.NetConnect", doc
+
+
+class IPDialog(Dialog):
+    """
+    IP settings of a saved connection
+    """
+
+    def __init__(self, app, profile):
+        self.profile = profile
+        name = app.profile_name(profile["uuid"])
+        super().__init__(app, f"IP settings of {name}", "Apply")
+        self.ipv4 = IPForm(4, profile["ipv4"])
+        self.ipv6 = IPForm(6, profile["ipv6"])
+        self.box.pack_start(label("IPv4", "net-title"), False, False, 0)
+        self.box.pack_start(self.ipv4.grid, False, False, 0)
+        self.box.pack_start(label("IPv6", "net-title"), False, False, 0)
+        self.box.pack_start(self.ipv6.grid, False, False, 0)
+        self.box.pack_start(
+            label(
+                "Apply reconnects this connection: the qubes behind the"
+                " network qube lose the network for a moment.",
+                "net-warning",
+                wrap=True,
+            ),
+            False,
+            False,
+            0,
+        )
+        self.finish_layout()
+        self.ipv4.sync()
+        self.ipv6.sync()
+
+    def request(self):
+        doc = {
+            "uuid": self.profile["uuid"],
+            "ipv4": self.ipv4.value(),
+            "ipv6": self.ipv6.value(),
+        }
+        return "qubes.NetConnect", doc
+
+
+class NetWidget(Gtk.Application):
+    def __init__(self, transport):
+        super().__init__(application_id=APP_ID)
+        self.transport = transport
+        self.status = None
+        self.scan = None
+        self.error = None
+        self.scanning = False
+        self.polling = False
+        self.menu = None
+        self.icon = None
+        self.dialogs = []
+        popup = Gio.SimpleAction.new("popup", None)
+        popup.connect("activate", lambda *_: self.popup(None))
+        self.add_action(popup)
+
+    def start(self):
+        self.icon = Gtk.StatusIcon()
+        self.icon.set_name("qubes-net-widget")
+        self.icon.set_title("Network")
+        self.icon.set_from_gicon(icon("offline"))
+        self.icon.connect("button-press-event", lambda _i, e: self.popup(e))
+        self.menu = Gtk.Menu()
+        self.menu.set_reserve_toggle_size(False)
+        load_style(self.menu)
+        self.refresh(scan=True)
+        GLib.timeout_add_seconds(POLL, self.poll)
+
+    def call(self, service, doc, done):
+        def worker():
+            try:
+                result, error = self.transport.call(service, doc), None
+            except CallError as e:
+                result, error = None, e
+            except Exception:
+                result, error = None, CallError("Failed to call the service")
+            GLib.idle_add(done, result, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll(self):
+        self.refresh(
+            scan=self.status is not None and self.has_wifi(), rescan=False
+        )
+        return True
+
+    def has_wifi(self):
+        return self.status["radio"]["devices"] > 0
+
+    def refresh(self, scan=False, rescan=True):
+        if not self.polling:
+            self.polling = True
+            self.call("qubes.NetStatus", {}, self.got_status)
+        if scan and not self.scanning:
+            self.scanning = True
+            self.call("qubes.NetScan", {"rescan": rescan}, self.got_scan)
+
+    def got_status(self, result, error):
+        self.polling = False
+        old = (self.status, self.error)
+        if error is None:
+            try:
+                self.status, self.error = clean_status(result), None
+            except BadAnswer:
+                self.status = None
+                self.error = f"Invalid answer from {self.transport.name}"
+        else:
+            self.status, self.error = None, str(error)
+        self.update_icon()
+        if (self.status, self.error) != old:
+            self.changed()
+
+    def got_scan(self, result, error):
+        self.scanning = False
+        old = self.scan
+        if error is None:
+            try:
+                self.scan = clean_scan(result)
+            except BadAnswer:
+                self.scan = None
+        if self.scan != old:
+            self.changed()
+
+    def changed(self):
+        if self.menu is None or not self.menu.get_visible():
+            return
+        # GTK does not resize a shown menu, pop it again
+        self.menu.popdown()
+        self.rebuild()
+        self.show_menu(None)
+
+    def primary_device(self):
+        if self.status is None:
+            return None
+        for d in self.status["devices"]:
+            if d["state"] == "connected" and (d["default4"] or d["default6"]):
+                return d
+        for d in self.status["devices"]:
+            if d["state"] == "connected":
+                return d
+        return None
+
+    def update_icon(self):
+        if self.error is not None or self.status is None:
+            self.icon.set_from_gicon(icon("error"))
+            self.icon.set_tooltip_text(self.error or "No status")
+            return
+        dev = self.primary_device()
+        if dev is None:
+            self.icon.set_from_gicon(icon("offline"))
+            self.icon.set_tooltip_text("Network: not connected")
+            return
+        name = self.profile_name(dev["profile"])
+        if dev["type"] == "ethernet":
+            self.icon.set_from_gicon(icon("wired"))
+            self.icon.set_tooltip_text(f"Ethernet {dev['iface']}: {name}")
+        else:
+            signal = dev["ap"]["signal"] if dev["ap"] else 0
+            self.icon.set_from_gicon(icon(f"wifi-{bars(signal)}"))
+            self.icon.set_tooltip_text(f"Wi-Fi: {name}, {signal}%")
+
+    def profile(self, uuid):
+        for p in self.status["profiles"] if self.status else []:
+            if p["uuid"] == uuid:
+                return p
+        return None
+
+    def profile_name(self, uuid):
+        p = self.profile(uuid)
+        if p is None:
+            return "unknown connection"
+        if p["type"] == "wifi":
+            return ssid_label(p["ssid"])
+        return p["name"]
+
+    def popup(self, event):
+        self.rebuild()
+        self.show_menu(event)
+        self.refresh(scan=True)
+        return True
+
+    def show_menu(self, event):
+        if event is not None:
+            self.menu.popup_at_pointer(event)
+            return
+        self.menu.popup(
+            None,
+            None,
+            Gtk.StatusIcon.position_menu,
+            self.icon,
+            0,
+            Gtk.get_current_event_time(),
+        )
+
+    def item(self, text, sub=None, image=None, sensitive=True, css=None):
+        mi = Gtk.MenuItem()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        if image is not None:
+            box.pack_start(
+                Gtk.Image.new_from_gicon(icon(image), Gtk.IconSize.MENU),
+                False,
+                False,
+                0,
+            )
+        box.pack_start(label(text, css), True, True, 0)
+        if sub:
+            box.pack_end(label(sub, "net-soft"), False, False, 0)
+        mi.add(box)
+        mi.set_sensitive(sensitive)
+        self.menu.append(mi)
+        return mi
+
+    def title(self, text):
+        return self.item(text, sensitive=False, css="net-title")
+
+    def rebuild(self):
+        if self.menu is None:
+            return
+        for child in self.menu.get_children():
+            self.menu.remove(child)
+            child.destroy()
+        where = self.transport.target if self.transport.dom0 else "network qube"
+        self.title(f"Network, from {where}")
+        if self.status is None:
+            self.item(
+                self.error or "Waiting for the network qube",
+                sensitive=False,
+                css="net-error" if self.error else "net-soft",
+            )
+            self.menu.show_all()
+            return
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.wired_items()
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.wifi_items()
+        self.menu.show_all()
+
+    def wired_items(self):
+        devs = [d for d in self.status["devices"] if d["type"] == "ethernet"]
+        wired = [p for p in self.status["profiles"] if p["type"] == "ethernet"]
+        if not devs:
+            self.item("Ethernet: no device", sensitive=False, css="net-soft")
+            return
+        primary = self.primary_device()
+        for d in devs:
+            state = STATES[d["state"]]
+            text = f"Ethernet {d['iface']}"
+            if d["profile"]:
+                text += f": {self.profile_name(d['profile'])}"
+            if d is primary:
+                state += ", carries the traffic"
+            mi = self.item(text, state, image="wired")
+            entries = []
+            p = self.profile(d["profile"]) if d["profile"] else None
+            if d["state"] in ("connected", "connecting"):
+                entries.append(
+                    (
+                        "Disconnect",
+                        lambda i=d["iface"]: self.disconnect_device(i),
+                    )
+                )
+            else:
+                for q in wired:
+                    entries.append(
+                        (
+                            f"Connect {q['name']}",
+                            lambda u=q["uuid"], i=d[
+                                "iface"
+                            ]: self.connect_profile(u, i),
+                        )
+                    )
+            for q in [p] if p else wired:
+                entries.append(
+                    (
+                        f"IP settings of {q['name']}...",
+                        lambda q=q: self.open_dialog(IPDialog(self, q)),
+                    )
+                )
+            if d["ipv4"]["addresses"] or d["ipv6"]["addresses"]:
+                shown = (d["ipv4"]["addresses"] + d["ipv6"]["addresses"])[:3]
+                word = "Addresses " if len(shown) > 1 else "Address "
+                entries.append((word + ", ".join(shown), None))
+            self.submenu_entries(mi, entries)
+
+    def submenu_entries(self, mi, entries):
+        sub = Gtk.Menu()
+        for text, action in entries:
+            child = Gtk.MenuItem.new_with_label(text)
+            if action is None:
+                child.set_sensitive(False)
+            else:
+                child.connect("activate", lambda _w, a=action: a())
+            sub.append(child)
+        sub.show_all()
+        mi.set_submenu(sub)
+
+    def wifi_items(self):
+        radio = self.status["radio"]
+        if radio["devices"] == 0:
+            self.item("Wi-Fi: no device", sensitive=False, css="net-soft")
+            return
+        switch = Gtk.CheckMenuItem.new_with_label("Wi-Fi")
+        switch.set_active(radio["enabled"])
+        switch.set_sensitive(radio["hardware"])
+        switch.connect("toggled", lambda w: self.set_radio(w.get_active()))
+        self.menu.append(switch)
+        if not radio["hardware"]:
+            self.item(
+                "Wi-Fi is off by its switch", sensitive=False, css="net-soft"
+            )
+            return
+        if not radio["enabled"]:
+            return
+        saved = {
+            p["ssid"]: p for p in self.status["profiles"] if p["type"] == "wifi"
+        }
+        active = {}
+        for d in self.status["devices"]:
+            if d["type"] == "wifi" and d["profile"]:
+                active[d["profile"]] = d
+        networks = self.scan["networks"] if self.scan else []
+        if self.scanning and not networks:
+            self.item("Scanning...", sensitive=False, css="net-soft")
+        seen = set()
+        for n in networks:
+            seen.add(n["ssid"])
+            p = saved.get(n["ssid"])
+            self.network_item(n, p, active.get(p["uuid"]) if p else None)
+        for ssid, p in saved.items():
+            if ssid not in seen:
+                self.network_item(None, p, active.get(p["uuid"]))
+        other = self.item("Hidden network...")
+        other.connect("activate", lambda *_: self.open_dialog(WifiDialog(self)))
+
+    def network_item(self, n, p, dev):
+        ssid = n["ssid"] if n else p["ssid"]
+        signal = n["signal"] if n else 0
+        security = n["security"] if n else p["security"]
+        notes = []
+        if dev is not None:
+            notes.append(STATES[dev["state"]].lower())
+        if p is not None:
+            notes.append("saved")
+        if n is None:
+            notes.append("not in range")
+        if security != "open":
+            notes.append(SECURITY[security])
+        mi = self.item(
+            ssid_label(ssid),
+            ", ".join(notes),
+            image=f"wifi-{bars(signal)}" if n else "wifi-0",
+        )
+        if p is None:
+            if security in CONNECTABLE:
+                mi.connect(
+                    "activate",
+                    lambda *_: self.open_dialog(WifiDialog(self, n)),
+                )
+            else:
+                mi.set_sensitive(False)
+            return
+        entries = []
+        if dev is not None:
+            entries.append(
+                ("Disconnect", lambda i=dev["iface"]: self.disconnect_device(i))
+            )
+        else:
+            entries.append(
+                ("Connect", lambda u=p["uuid"]: self.connect_profile(u))
+            )
+        entries.append(
+            ("IP settings...", lambda: self.open_dialog(IPDialog(self, p)))
+        )
+        entries.append(("Forget...", lambda: self.forget(p)))
+        self.submenu_entries(mi, entries)
+
+    def open_dialog(self, dialog):
+        self.dialogs.append(dialog)
+        dialog.connect("destroy", self.dialogs.remove)
+        dialog.present()
+
+    def report(self, _result, error):
+        if error is not None:
+            msg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text="Network",
+            )
+            # Not format_secondary_text, a printf on untrusted text
+            msg.set_property("secondary-text", str(error))
+            msg.set_keep_above(True)
+            msg.connect("response", lambda d, _r: d.destroy())
+            msg.show()
+        self.refresh(scan=True)
+
+    def disconnect_device(self, iface):
+        self.call("qubes.NetDisconnect", {"device": iface}, self.report)
+
+    def connect_profile(self, uuid, iface=None):
+        doc = {"uuid": uuid}
+        if iface:
+            doc["device"] = iface
+        self.call("qubes.NetConnect", doc, self.report)
+
+    def set_radio(self, enabled):
+        self.call("qubes.NetRadio", {"enabled": enabled}, self.report)
+
+    def forget(self, p):
+        ask = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f"Forget {ssid_label(p['ssid'])}?",
+        )
+        ask.set_property(
+            "secondary-text",
+            "The network and its password are deleted from the network qube.",
+        )
+        ask.set_keep_above(True)
+
+        def answer(d, response):
+            d.destroy()
+            if response == Gtk.ResponseType.OK:
+                self.call("qubes.NetForget", {"uuid": p["uuid"]}, self.report)
+
+        ask.connect("response", answer)
+        ask.show()
+
+
+def main():
+    global ASCII_ONLY  # pylint: disable=global-statement
+    # No core dump holding a password
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+    parser = argparse.ArgumentParser(description=__doc__.strip())
+    parser.add_argument(
+        "--popup", action="store_true", help="open the running widget's menu"
+    )
+    args = parser.parse_args()
+    transport = load_transport()
+    if transport is None:
+        return 0
+    ASCII_ONLY = transport.dom0
+    app = NetWidget(transport)
+    app.register(None)
+    if app.get_is_remote():
+        if args.popup:
+            app.activate_action("popup", None)
+        return 0
+    app.start()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

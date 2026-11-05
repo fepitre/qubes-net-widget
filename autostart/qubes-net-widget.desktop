@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Network Tray
+Comment=Ethernet and Wi-Fi of the network qube
+Icon=/usr/share/qubes-net-widget/icons/qubes-net-wired.svg
+Exec=systemctl --user start qubes-widget@qubes-net-widget
+Terminal=false
+NoDisplay=true
+OnlyShowIn=XFCE;
